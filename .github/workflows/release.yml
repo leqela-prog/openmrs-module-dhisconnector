@@ -1,0 +1,67 @@
+name: Build and Release OMOD Artifacts
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+    # -------------------------------
+    # Checkout source code
+    # -------------------------------
+    - name: Checkout source code
+      uses: actions/checkout@v4
+
+    # -------------------------------
+    # Setup Java 8
+    # -------------------------------
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: '8'
+
+    # -------------------------------
+    # Setup Maven 3.6.3 (SDKMAN)
+    # -------------------------------
+    - name: Setup Maven
+      run: |
+        curl -s "https://get.sdkman.io" | bash
+        source "$HOME/.sdkman/bin/sdkman-init.sh"
+        sdk install maven 3.6.3
+        sdk use maven 3.6.3
+        mvn -v
+
+    # -------------------------------
+    # Build full module (API + OMOD)
+    # -------------------------------
+    - name: Build OpenMRS module
+      run: |
+        source "$HOME/.sdkman/bin/sdkman-init.sh"
+        mvn clean install -DskipTests
+
+    # -------------------------------
+    # Upload artifacts to release repo
+    # -------------------------------
+    - name: Publish OMOD artifacts
+      env:
+        GH_TOKEN: ${{ secrets.GH_PAT }}
+      run: |
+        git clone https://$GH_TOKEN@github.com/petershale21/openmrs-module-dhisconnector-release.git release-repo
+
+        cd release-repo
+        git rm -rf . || true
+        git clean -fd || true
+
+        cp -r ../omod/target/* .
+
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+
+        git add .
+        git commit -m "Update OMOD artifacts from ${GITHUB_SHA}" || echo "No changes to commit"
+        git push

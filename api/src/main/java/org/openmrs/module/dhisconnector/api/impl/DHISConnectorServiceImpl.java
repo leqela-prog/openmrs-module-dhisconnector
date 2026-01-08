@@ -164,7 +164,7 @@ public class DHISConnectorServiceImpl extends BaseOpenmrsService implements DHIS
 
 	public static final String ZIP_FILE_SUFFIX = ".zip";
 	
-	public static final String DHISCONNECTOR_ORGUNIT_RESOURCE = "/api/organisationUnits.json?paging=false&fields=:identifiable,displayName";
+	public static final String DHISCONNECTOR_ORGUNIT_RESOURCE = "/api/organisationUnits.json?paging=false&fields=identifiable,displayName";
 	
 	public static final String DATAVALUESETS_PATH = "/api/dataValueSets";
 	
@@ -266,6 +266,7 @@ public class DHISConnectorServiceImpl extends BaseOpenmrsService implements DHIS
 	
 	@Override
 	public String getDataFromDHISEndpoint(String endpoint) {
+		endpoint = endpoint.replaceAll("//+", "/"); //remove any double slash in endpoint link because DHIS2 rejects it since switching to https
 		String url = Context.getAdministrationService().getGlobalProperty("dhisconnector.url");
 		String user = Context.getAdministrationService().getGlobalProperty("dhisconnector.user");
 		String pass = Context.getAdministrationService().getGlobalProperty("dhisconnector.pass");

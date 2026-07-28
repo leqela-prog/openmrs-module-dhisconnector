@@ -34,12 +34,21 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
+import java.util.Collections;
 import java.util.Date;
 import java.util.GregorianCalendar;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
@@ -183,6 +192,25 @@ public class DHISConnectorServiceImpl extends BaseOpenmrsService implements DHIS
 	private Configurations configs = new Configurations();
 	
 	private AdxObjectFactory factory = new AdxObjectFactory();
+
+	/**
+	 * Cache that stores already-run report results keyed by
+	 * "reportDefinitionUUID|locationId|periodString".
+	 * This avoids re-running the same cohort queries when the same report/period/location
+	 * combination is needed by more than one mapping in a single automation cycle.
+	 * The cache is cleared at the start of every runAllAutomatedReportsAndPostToDHIS() call
+	 * so that each scheduled cycle always works with fresh data.
+	 */
+	private final Map<String, Report> reportCache = new ConcurrentHashMap<String, Report>();
+
+	/**
+	 * Number of mapping tasks to execute in parallel during automation.
+	 * Defaults to the number of available CPU cores so the JVM can saturate them
+	 * while individual tasks are blocked waiting for DB results.
+	 * Can be tuned down on resource-constrained servers.
+	 */
+	private static final int AUTOMATION_THREAD_POOL_SIZE =
+			Math.max(2, Runtime.getRuntime().availableProcessors());
 	
 	/**
 	 * @param dao the dao to set
@@ -809,23 +837,36 @@ public class DHISConnectorServiceImpl extends BaseOpenmrsService implements DHIS
 
 	@Override
 	public DHISDataSet getDHISDataSetById(String id) {
-		DHISDataSet dataSet = new DHISDataSet();
 		ObjectMapper mapper = new ObjectMapper();
-		String jsonResponse = new String();
-		JsonNode node;
 
-		jsonResponse = getDataFromDHISEndpoint(DATASETS_PATH+"/"+id);
+		// FIX 1: DATASETS_PATH already ends with '/', so do NOT add another '/'
+		// before the id. The previous code produced "/api/dataSets//id" (double
+		// slash), which returns a 404 on DHIS2 for any dataset that has no backup
+		// cache on disk yet — silently failing for newly created datasets.
+		String jsonResponse = getDataFromDHISEndpoint(DATASETS_PATH + id);
+
+		// FIX 2: Guard against null/blank response before handing it to Jackson.
+		// getDataFromDHISEndpoint() returns null when neither the live call nor the
+		// backup file produced a result (e.g. brand-new dataset UID, DHIS2 down).
+		// mapper.readTree(null) would throw a NullPointerException that was
+		// previously swallowed by the catch block, leaving an empty DHISDataSet.
+		if (jsonResponse == null || jsonResponse.trim().isEmpty()) {
+			log.error("DHISConnector: Could not retrieve dataset with UID [" + id
+					+ "] from DHIS2 or local backup. "
+					+ "Verify the dataset UID is correct and that it exists in DHIS2, "
+					+ "then ensure DHIS2 is reachable so the module can cache the response.");
+			return null;
+		}
 
 		try {
 			mapper.configure(DeserializationConfig.Feature.FAIL_ON_UNKNOWN_PROPERTIES, false);
-			node = mapper.readTree(jsonResponse);
-			dataSet = mapper.readValue(node.toString(), DHISDataSet.class);
+			JsonNode node = mapper.readTree(jsonResponse);
+			return mapper.readValue(node.toString(), DHISDataSet.class);
 		}
 		catch (Exception ex) {
-			System.out.print(ex.getMessage());
+			log.error("DHISConnector: Failed to deserialize DHIS2 dataset response for UID [" + id + "]: " + ex.getMessage(), ex);
+			return null;
 		}
-
-		return dataSet;
 	}
 
 	private boolean mappingsHasGUID(List<DHISMapping> mappings, String GUID) {
@@ -1363,7 +1404,7 @@ public class DHISConnectorServiceImpl extends BaseOpenmrsService implements DHIS
 			Integer retryCount = determineRetryCount(reportToDatasetMapping);
 			Calendar latestRetryDate = Calendar.getInstance(Context.getLocale());
 
-			if(reportToDatasetMapping.getLastPushRetry() != null && reportToDatasetMapping.getRetryCount() != 3 && retryCount != 1) {
+			if (reportToDatasetMapping.getLastPushRetry() != null && reportToDatasetMapping.getRetryCount() != 3 && retryCount != 1) {
 				latestRetryDate.setTime(reportToDatasetMapping.getLastPushRetry());
 			} else if (reportToDatasetMapping.getLastPushRetry() == null || retryCount == 1) {
 				latestRetryDate.setTime(startDate.getTime());
@@ -1371,6 +1412,26 @@ public class DHISConnectorServiceImpl extends BaseOpenmrsService implements DHIS
 
 			if (mapping != null) {
 				DHISDataSet dataSet = getDHISDataSetById(mapping.getDataSetUID());
+
+				// FIX 3: Validate the dataset before attempting to use it.
+				// getDHISDataSetById() now returns null on any fetch/parse failure,
+				// so a null check here surfaces the problem instead of silently
+				// doing nothing. We also guard against a dataset that was fetched
+				// successfully but has no org units assigned in DHIS2 yet.
+				if (dataSet == null || dataSet.getId() == null) {
+					log.error("DHISConnector: Skipping mapping [" + reportToDatasetMapping.getMapping()
+							+ "] — could not fetch dataset with UID [" + mapping.getDataSetUID()
+							+ "]. Check the dataset UID in the mapping and ensure it exists in DHIS2.");
+					return responseString;
+				}
+				if (dataSet.getOrganisationUnits() == null || dataSet.getOrganisationUnits().isEmpty()) {
+					log.error("DHISConnector: Skipping mapping [" + reportToDatasetMapping.getMapping()
+							+ "] — dataset [" + mapping.getDataSetUID()
+							+ "] has no organisation units assigned. "
+							+ "Assign org units to this dataset in DHIS2 before running automation.");
+					return responseString;
+				}
+
 				String periodType = mapping.getPeriodType();
 				PeriodIndicatorReportDefinition ranReportDef = (PeriodIndicatorReportDefinition) Context
 						.getService(ReportDefinitionService.class)
@@ -1381,7 +1442,7 @@ public class DHISConnectorServiceImpl extends BaseOpenmrsService implements DHIS
 				String period = transformToDHISPeriod(startDate, endDate, periodType, lastRun, nextRetryCount, latestRetryDate.getTime());
 
 				List<DHISOrganisationUnit> orgs = dataSet.getOrganisationUnits();
-				for (DHISOrganisationUnit takenOrgUnit: orgs){
+				for (DHISOrganisationUnit takenOrgUnit : orgs) {
 					String orgUnitUid = takenOrgUnit.getId();
 					LocationToOrgUnitMapping locationToOrgUnitMapping = Context.getService(DHISConnectorService.class)
 							.getLocationToOrgUnitMappingByOrgUnitUid(orgUnitUid);
@@ -1389,7 +1450,21 @@ public class DHISConnectorServiceImpl extends BaseOpenmrsService implements DHIS
 					if (locationToOrgUnitMapping != null && ranReportDef != null) {
 						Location location = locationToOrgUnitMapping.getLocation();
 						if (StringUtils.isNotBlank(period)) {
-							Report ranReport = runPeriodIndicatorReport(ranReportDef, startDate.getTime(), endDate.getTime(), location);
+							// FIX: Use cached report result when the same report + period + location
+							// was already run earlier in this automation cycle. This avoids re-running
+							// the same expensive cohort queries multiple times for the same combination.
+							String cacheKey = ranReportDef.getUuid() + "|" + location.getId() + "|" + period;
+							Report ranReport = reportCache.get(cacheKey);
+							if (ranReport == null) {
+								log.info("Cache MISS – running report for key: " + cacheKey);
+								ranReport = runPeriodIndicatorReport(ranReportDef, startDate.getTime(), endDate.getTime(), location);
+								if (ranReport != null) {
+									reportCache.put(cacheKey, ranReport);
+								}
+							} else {
+								log.info("Cache HIT – reusing report result for key: " + cacheKey);
+							}
+
 							if (ranReport != null) {
 								Object response = sendReportDataToDHIS(ranReport, mapping, period, orgUnitUid);
 
@@ -1784,19 +1859,99 @@ public class DHISConnectorServiceImpl extends BaseOpenmrsService implements DHIS
 	
 	@Override
 	public ArrayList<List<String>> runAllAutomatedReportsAndPostToDHIS() {
-		ArrayList<List<String>> responses = new ArrayList<>();
+		// Clear the per-cycle report cache so every automation run starts fresh.
+		reportCache.clear();
+		log.info("DHISConnector: starting automation cycle. Thread pool size: " + AUTOMATION_THREAD_POOL_SIZE);
+
+		final ArrayList<List<String>> responses = Collections.synchronizedList(new ArrayList<List<String>>());
 		List<ReportToDataSetMapping> mps = getAllReportToDataSetMappings();
-		
-		if (mps != null) {
-			for (ReportToDataSetMapping m : mps) {
-				List<String> resp = runAndPushReportToDHIS(m);
-				
-				if (!resp.isEmpty())
-					responses.add(resp);
+
+		if (mps == null || mps.isEmpty()) {
+			log.info("DHISConnector: no mappings found, automation cycle complete.");
+			return new ArrayList<List<String>>(responses);
+		}
+
+		// FIX: Run each mapping in parallel using a fixed thread pool.
+		// Each mapping's full execution (report run + DHIS2 POST) happens on its own
+		// thread, so N mappings that previously took N×7 min now take closer to 7 min
+		// total (assuming enough CPU cores / DB connection capacity).
+		// OpenMRS Context is propagated to each worker thread so service calls work correctly.
+		ExecutorService executor = Executors.newFixedThreadPool(AUTOMATION_THREAD_POOL_SIZE);
+		final org.openmrs.User currentUser = Context.getAuthenticatedUser();
+
+		// Capture credentials for worker thread authentication.
+		// When running from the scheduler the daemon user's credentials are available.
+		final String daemonUserSystemId = (currentUser != null) ? currentUser.getSystemId() : null;
+
+		List<Future<List<String>>> futures = new ArrayList<Future<List<String>>>();
+		for (final ReportToDataSetMapping m : mps) {
+			futures.add(executor.submit(new Callable<List<String>>() {
+				@Override
+				public List<String> call() {
+					// Each worker thread needs its own OpenMRS context session.
+					// Without this, Hibernate session and service lookups will fail.
+					Context.openSession();
+					try {
+						// Re-authenticate inside the new thread's session so that
+						// privileged service calls (ReportService, AdministrationService,
+						// ReportDefinitionService, etc.) have the required privileges.
+						if (daemonUserSystemId != null) {
+							Context.becomeUser(daemonUserSystemId);
+						} else {
+							// Fallback: grant all required privileges as proxy privileges
+							// so the thread can call services without a logged-in user.
+							Context.addProxyPrivilege("Run Reports");
+							Context.addProxyPrivilege("View Reports");
+							Context.addProxyPrivilege("Get Global Properties");
+						}
+						List<String> resp = runAndPushReportToDHIS(m);
+						if (resp != null && !resp.isEmpty()) {
+							responses.add(resp);
+						}
+						return resp;
+					} catch (Exception e) {
+						log.error("DHISConnector: error running mapping [" + m.getMapping() + "] in background thread", e);
+						return Collections.emptyList();
+					} finally {
+						if (daemonUserSystemId == null) {
+							Context.removeProxyPrivilege("Run Reports");
+							Context.removeProxyPrivilege("View Reports");
+							Context.removeProxyPrivilege("Get Global Properties");
+						}
+						Context.closeSession();
+					}
+				}
+			}));
+		}
+
+		// Wait for all mapping tasks to finish before returning results.
+		executor.shutdown();
+		try {
+			// Allow up to 2 hours for all mappings to complete before forcing shutdown.
+			if (!executor.awaitTermination(2, TimeUnit.HOURS)) {
+				log.warn("DHISConnector: automation timed out waiting for all mapping tasks – forcing shutdown.");
+				executor.shutdownNow();
+			}
+		} catch (InterruptedException ie) {
+			log.warn("DHISConnector: automation interrupted while waiting for mapping tasks.", ie);
+			executor.shutdownNow();
+			Thread.currentThread().interrupt();
+		}
+
+		// Collect any exceptions that bubbled up from the futures (for logging).
+		for (Future<List<String>> f : futures) {
+			try {
+				f.get();
+			} catch (ExecutionException ee) {
+				log.error("DHISConnector: a mapping task threw an exception during automation", ee.getCause());
+			} catch (InterruptedException ie) {
+				Thread.currentThread().interrupt();
 			}
 		}
-		
-		return responses;
+
+		log.info("DHISConnector: automation cycle complete. Mappings processed: " + mps.size()
+				+ ", responses collected: " + responses.size());
+		return new ArrayList<List<String>>(responses);
 	}
 
 	@Override

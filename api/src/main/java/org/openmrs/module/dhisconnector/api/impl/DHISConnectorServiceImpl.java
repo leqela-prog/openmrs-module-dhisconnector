@@ -837,23 +837,36 @@ public class DHISConnectorServiceImpl extends BaseOpenmrsService implements DHIS
 
 	@Override
 	public DHISDataSet getDHISDataSetById(String id) {
-		DHISDataSet dataSet = new DHISDataSet();
 		ObjectMapper mapper = new ObjectMapper();
-		String jsonResponse = new String();
-		JsonNode node;
 
-		jsonResponse = getDataFromDHISEndpoint(DATASETS_PATH+"/"+id);
+		// FIX 1: DATASETS_PATH already ends with '/', so do NOT add another '/'
+		// before the id. The previous code produced "/api/dataSets//id" (double
+		// slash), which returns a 404 on DHIS2 for any dataset that has no backup
+		// cache on disk yet — silently failing for newly created datasets.
+		String jsonResponse = getDataFromDHISEndpoint(DATASETS_PATH + id);
+
+		// FIX 2: Guard against null/blank response before handing it to Jackson.
+		// getDataFromDHISEndpoint() returns null when neither the live call nor the
+		// backup file produced a result (e.g. brand-new dataset UID, DHIS2 down).
+		// mapper.readTree(null) would throw a NullPointerException that was
+		// previously swallowed by the catch block, leaving an empty DHISDataSet.
+		if (jsonResponse == null || jsonResponse.trim().isEmpty()) {
+			log.error("DHISConnector: Could not retrieve dataset with UID [" + id
+					+ "] from DHIS2 or local backup. "
+					+ "Verify the dataset UID is correct and that it exists in DHIS2, "
+					+ "then ensure DHIS2 is reachable so the module can cache the response.");
+			return null;
+		}
 
 		try {
 			mapper.configure(DeserializationConfig.Feature.FAIL_ON_UNKNOWN_PROPERTIES, false);
-			node = mapper.readTree(jsonResponse);
-			dataSet = mapper.readValue(node.toString(), DHISDataSet.class);
+			JsonNode node = mapper.readTree(jsonResponse);
+			return mapper.readValue(node.toString(), DHISDataSet.class);
 		}
 		catch (Exception ex) {
-			System.out.print(ex.getMessage());
+			log.error("DHISConnector: Failed to deserialize DHIS2 dataset response for UID [" + id + "]: " + ex.getMessage(), ex);
+			return null;
 		}
-
-		return dataSet;
 	}
 
 	private boolean mappingsHasGUID(List<DHISMapping> mappings, String GUID) {
@@ -1399,6 +1412,26 @@ public class DHISConnectorServiceImpl extends BaseOpenmrsService implements DHIS
 
 			if (mapping != null) {
 				DHISDataSet dataSet = getDHISDataSetById(mapping.getDataSetUID());
+
+				// FIX 3: Validate the dataset before attempting to use it.
+				// getDHISDataSetById() now returns null on any fetch/parse failure,
+				// so a null check here surfaces the problem instead of silently
+				// doing nothing. We also guard against a dataset that was fetched
+				// successfully but has no org units assigned in DHIS2 yet.
+				if (dataSet == null || dataSet.getId() == null) {
+					log.error("DHISConnector: Skipping mapping [" + reportToDatasetMapping.getMapping()
+							+ "] — could not fetch dataset with UID [" + mapping.getDataSetUID()
+							+ "]. Check the dataset UID in the mapping and ensure it exists in DHIS2.");
+					return responseString;
+				}
+				if (dataSet.getOrganisationUnits() == null || dataSet.getOrganisationUnits().isEmpty()) {
+					log.error("DHISConnector: Skipping mapping [" + reportToDatasetMapping.getMapping()
+							+ "] — dataset [" + mapping.getDataSetUID()
+							+ "] has no organisation units assigned. "
+							+ "Assign org units to this dataset in DHIS2 before running automation.");
+					return responseString;
+				}
+
 				String periodType = mapping.getPeriodType();
 				PeriodIndicatorReportDefinition ranReportDef = (PeriodIndicatorReportDefinition) Context
 						.getService(ReportDefinitionService.class)
